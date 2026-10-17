@@ -1,0 +1,27 @@
+# 编译产物
+*.exe
+*.res.o
+*.o
+*.obj
+*.pdb
+
+# 运行日志
+CamFix.log
+CamFix.log.old
+recover-log.txt
+quality-log.txt
+auto-verify-log.txt
+*.log
+
+# 预览图（图标源码保留，预览图不入库）
+icon-preview*.png
+icon-sizes.png
+
+# 抓帧/临时文件
+cam_frames/
+quality-frames/
+*.jpg
+
+# 备份
+backup/
+_old-*/
