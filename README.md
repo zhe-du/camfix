@@ -46,6 +46,7 @@
 
 微软对此有专门定义:bug check **`0x1A5 USB_DRIPS_BLOCKER_SURPRISE_REMOVAL_LIVEDUMP`** ——
 *"阻止顶层控制器在现代待机期间断电的 USB 设备,将被强制移除(surprise removed)。"*
+![系统事件日志证据](docs/evidence-windows-drips.png)
 
 **于是三种症状对应同一原因:**
 - 移除成功 → 相机消失(症状 A)
