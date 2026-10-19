@@ -426,6 +426,179 @@ static int FixDeviceParams(const std::vector<std::wstring>& keys) {
     return n;
 }
 
+// ---------------- 深度修复用的底层能力 ----------------
+// 隐藏执行外部命令（只用于 pnputil 的「动作」，绝不用来解析任何本地化文本）
+static bool RunHidden(const std::wstring& cmd, DWORD timeoutMs = 30000) {
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &si, &pi)) return false;
+    WaitForSingleObject(pi.hProcess, timeoutMs);
+    DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return code == 0;
+}
+
+// 从 Enum\USB\<hwid>\<inst> 收集完整设备实例 ID（含「幽灵」设备）
+// 幽灵设备在 SetupAPI 的 present 枚举里拿不到，只能从注册表挖。
+static std::vector<std::wstring> EnumInstanceIds(const wchar_t* hwidPart) {
+    std::vector<std::wstring> out;
+    HKEY hUsb = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kEnumUsb, 0, KEY_READ, &hUsb) != ERROR_SUCCESS) return out;
+    wchar_t sub[512]{};
+    for (DWORD i = 0; RegEnumKeyW(hUsb, i, sub, 512) == ERROR_SUCCESS; ++i) {
+        if (wcsstr(sub, hwidPart) == nullptr) continue;
+        std::wstring base = std::wstring(kEnumUsb) + L"\\" + sub;
+        HKEY hSub = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, base.c_str(), 0, KEY_READ, &hSub) != ERROR_SUCCESS) continue;
+        wchar_t inst[512]{};
+        for (DWORD j = 0; RegEnumKeyW(hSub, j, inst, 512) == ERROR_SUCCESS; ++j)
+            out.push_back(std::wstring(L"USB\\") + sub + L"\\" + inst);
+        RegCloseKey(hSub);
+    }
+    RegCloseKey(hUsb);
+    return out;
+}
+
+// 启用/禁用设备 = 设备管理器右键「禁用设备」/「启用设备」
+static bool SetDeviceEnabled(const std::wstring& instanceId, bool enable) {
+    HDEVINFO h = SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    SP_DEVINFO_DATA d{}; d.cbSize = sizeof(d);
+    bool ok = false;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(h, i, &d); ++i) {
+        wchar_t id[512]{};
+        if (!SetupDiGetDeviceInstanceIdW(h, &d, id, 512, nullptr)) continue;
+        if (_wcsicmp(id, instanceId.c_str()) != 0) continue;
+        SP_PROPCHANGE_PARAMS p{};
+        p.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+        p.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+        p.StateChange = enable ? DICS_ENABLE : DICS_DISABLE;
+        p.Scope = DICS_FLAG_GLOBAL;
+        p.HwProfile = 0;
+        if (SetupDiSetClassInstallParamsW(h, &d, &p.ClassInstallHeader, sizeof(p)))
+            ok = (SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, h, &d) != FALSE);
+        break;
+    }
+    SetupDiDestroyDeviceInfoList(h);
+    return ok;
+}
+
+// 读注册表属性里的多字符串（REG_MULTI_SZ），判断是否含某个 ID
+static bool PropContains(HDEVINFO h, SP_DEVINFO_DATA& d, DWORD prop, const wchar_t* needle) {
+    DWORD bytes = 0;
+    if (!SetupDiGetDeviceRegistryPropertyW(h, &d, prop, nullptr, nullptr, 0, &bytes)) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0) return false;
+    }
+    if (bytes == 0) return false;
+    std::vector<wchar_t> wbuf(bytes / sizeof(wchar_t) + 2, 0);
+    if (!SetupDiGetDeviceRegistryPropertyW(h, &d, prop, nullptr, (PBYTE)wbuf.data(), bytes, nullptr))
+        return false;
+    size_t total = bytes / sizeof(wchar_t);
+    size_t off = 0;
+    while (off < total && wbuf[off]) {
+        std::wstring s(&wbuf[off]);
+        if (!s.empty() && s.find(needle) != std::wstring::npos) return true;
+        off += s.size() + 1;
+    }
+    return false;
+}
+
+// 找 xHCI 控制器：PCI 类代码 0C0330（可扩展主机控制器）
+// 注意: 该 ID 出现在「兼容 ID」(SPDRP_COMPATIBLEIDS) 里，硬件 ID 里没有 —— 两处都查
+static std::vector<std::wstring> FindXhciControllers() {
+    std::vector<std::wstring> out;
+    HDEVINFO h = SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    SP_DEVINFO_DATA d{}; d.cbSize = sizeof(d);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(h, i, &d); ++i) {
+        bool isXhci = PropContains(h, d, SPDRP_COMPATIBLEIDS, L"PCI\\CC_0C0330") ||
+                      PropContains(h, d, SPDRP_HARDWAREID,    L"PCI\\CC_0C0330");
+        if (!isXhci) continue;
+        wchar_t id[512]{};
+        if (SetupDiGetDeviceInstanceIdW(h, &d, id, 512, nullptr)) out.push_back(id);
+    }
+    SetupDiDestroyDeviceInfoList(h);
+    return out;
+}
+
+static bool CameraUsable() {
+    auto cams = EnumCameras();
+    for (const auto& c : cams) if (c.started) return true;
+    return false;
+}
+
+// 深度修复阶梯：清幽灵节点 -> 重扫 -> 重启根集线器 -> 循环 xHCI 控制器
+// 硬约束：只动设备枚举，绝不修改任何电源设置（S0 / 睡眠 / 休眠 / WOL）
+static bool DeepRepairLadder() {
+    SetColor(C_HEAD); Line(L"");
+    Line(L"  ---------- 深度修复（只动设备枚举，不改电源） ----------");
+    SetColor(C_DEF);
+
+    // 1) 清掉相机的幽灵节点（含 MI_00 / MI_02 / MI_04 与复合设备本体）
+    int nCam = 0;
+    for (const auto& id : EnumInstanceIds(kCamIdPart)) {
+        if (RunHidden(L"pnputil.exe /remove-device \"" + id + L"\"")) {
+            Line(L"      移除 %ls", id.c_str());
+            nCam++;
+        }
+    }
+    Line(L"  [1/4] 清理幽灵相机节点: %d 个", nCam);
+
+    // 2) 清掉「设备描述符请求失败」占位节点
+    int nBad = 0;
+    for (const auto& id : EnumInstanceIds(L"VID_0000&PID_0002")) {
+        if (RunHidden(L"pnputil.exe /remove-device \"" + id + L"\"")) {
+            Line(L"      移除 %ls", id.c_str());
+            nBad++;
+        }
+    }
+    Line(L"  [2/4] 清理描述符失败节点: %d 个", nBad);
+    Sleep(1500);
+
+    // 3) 重新扫描
+    Line(L"  [3/4] 重新扫描硬件 ...");
+    RunHidden(L"pnputil.exe /scan-devices");
+    Sleep(6000);
+    if (CameraUsable()) { Ok(L"重扫后相机已回来"); return true; }
+
+    // 4) 重启相机所在根集线器
+    std::wstring hub;
+    if (FindInstance(std::wstring(kRootHubHint) + L"\\", hub)) {
+        if (RestartDevice(hub)) Ok((std::wstring(L"已重启根集线器: ") + hub).c_str());
+        else Warn(L"重启根集线器失败");
+    } else Warn(L"没找到 USB 根集线器");
+    Sleep(6000);
+    if (CameraUsable()) { Ok(L"重启集线器后相机已回来"); return true; }
+
+    // 5) 最后一招：循环 xHCI 控制器（整条 USB 链路重新枚举）
+    auto xh = FindXhciControllers();
+    if (xh.empty()) { Warn(L"没找到 xHCI 控制器, 跳过最后一招"); }
+    else {
+        Line(L"  [!]  根集线器无效, 改为循环 USB xHCI 控制器（该控制器上的 USB 设备会短暂消失约 10 秒）");
+        for (const auto& id : xh) {
+            Line(L"      循环 %ls", id.c_str());
+            SetDeviceEnabled(id, false);
+            Sleep(5000);
+            SetDeviceEnabled(id, true);
+        }
+        Sleep(10000);
+        RunHidden(L"pnputil.exe /scan-devices");
+        Sleep(5000);
+    }
+    if (CameraUsable()) return true;
+
+    // 定性：端口上又冒出「描述符请求失败」占位节点 = 设备通电有响应，但答不出 USB 描述符
+    if (!EnumInstanceIds(L"VID_0000&PID_0002").empty()) {
+        Warn(L"端口上仍有「设备描述符请求失败」节点 → 设备通电, 但答不出 USB 描述符");
+        Line(L"      这属于电气/接触层面（排线、连接器、供电），软件已无法再修。");
+        Line(L"      建议：完全关机 → 拔电源 → 长按电源键 30-60 秒 → 开机；仍无效则为硬件故障。");
+    }
+    return false;
+}
+
 // ---------------- 诊断 ----------------
 struct Diag {
     std::vector<DevItem> cams;
@@ -561,10 +734,11 @@ static void PrintHelp() {
     SetColor(C_DEF);
     Line(L"");
     Line(L"  用法:");
-    Line(L"    CamFix.exe              诊断; 需要时才提权恢复(正常时免 UAC、不打扰)");
+    Line(L"    CamFix.exe              一键修复: 诊断 → 需要时自动深度修复(正常时免 UAC、不打扰)");
     Line(L"    CamFix.exe --diag       只诊断, 免管理员");
     Line(L"    CamFix.exe --status     单行状态输出(供脚本/自启动判断)");
     Line(L"    CamFix.exe --recover    只重启相机设备(恢复画质)");
+    Line(L"    CamFix.exe --deep       强制深度修复: 清幽灵节点 + 重扫 + 根集线器 + xHCI 循环");
     Line(L"    CamFix.exe --repair     完整修复: 备份 + 设备级参数 + 全局 hub 开关 + 电源计划 + 重启");
     Line(L"    CamFix.exe --restore    回滚到最近一次 backup\\*.reg");
     Line(L"    CamFix.exe --auto       静默自检(供开机自启): 写日志, 异常才弹窗");
@@ -667,7 +841,7 @@ int wmain(int argc, wchar_t** argv) {
         WriteUtf8(g_log, sep);
     }
 
-    bool diagOnly = false, doRepair = false, doRestore = false, doRecover = false;
+    bool diagOnly = false, doRepair = false, doRestore = false, doRecover = false, doDeep = false;
     bool showHelp = false, showVer = false, autoMode = false, statusOneLine = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
@@ -675,6 +849,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--repair")  doRepair = true;
         else if (a == L"--restore") doRestore = true;
         else if (a == L"--recover") doRecover = true;
+        else if (a == L"--deep")    doDeep = true;          // 强制深度修复阶梯
         else if (a == L"--auto")    autoMode = true;        // 静默自检(供开机自启)
         else if (a == L"--status")  statusOneLine = true;   // 单行状态(供脚本调用)
         else if (a == L"--help" || a == L"-h" || a == L"/?") showHelp = true;
@@ -684,7 +859,7 @@ int wmain(int argc, wchar_t** argv) {
     if (autoMode) g_noPause = true;
 
     if (showVer) {
-        Line(L"CamFix 1.1.0  (C++17 / Win32, MinGW-w64 build)");
+        Line(L"CamFix 1.2.1  (C++17 / Win32, MinGW-w64 build)");
         return 0;
     }
     if (showHelp) {
@@ -717,7 +892,7 @@ int wmain(int argc, wchar_t** argv) {
 
     // 无参数 / --recover: 先看诊断结果, 只有真需要动作才提权 —— 正常时不打扰
     if (!diagOnly && !doRepair && !doRestore) {
-        bool needAction = doRecover || !d.camPresent ||
+        bool needAction = doRecover || doDeep || !d.camPresent ||
                           (d.fmt.count >= 0 && (d.fmt.count < 5 || !d.fmt.has1080));
         if (needAction && !IsElevated()) {
             SetColor(C_WARN);
@@ -787,7 +962,7 @@ int wmain(int argc, wchar_t** argv) {
     // ---- 恢复: 相机缺失或降级 就重启设备 ----
     bool degraded = d.camPresent && d.fmt.count >= 0 && (d.fmt.count < 5 || !d.fmt.has1080);
     bool missing  = !d.camPresent;
-    if (doRecover || doRepair || degraded || missing) {
+    if (doRecover || doRepair || degraded || missing || doDeep) {
         SetColor(C_HEAD); Line(L"");
         Line(L"  ---------- 动作 ----------"); SetColor(C_DEF);
 
@@ -811,6 +986,12 @@ int wmain(int argc, wchar_t** argv) {
             else Warn(L"电源计划写入失败");
             actions++;
         }
+
+        if (missing || doDeep) {
+            // 相机完全不在场 —— 走深度修复阶梯（清幽灵节点 / 重扫 / 根集线器 / xHCI）
+            DeepRepairLadder();
+            actions++;
+        } else {
 
         // 重启复合设备(等效拔插), 需要管理员
         std::wstring compId;
@@ -838,6 +1019,7 @@ int wmain(int argc, wchar_t** argv) {
         if (CM_Locate_DevNodeW(&root, nullptr, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS)
             CM_Reenumerate_DevNode(root, CM_REENUMERATE_SYNCHRONOUS);
         Sleep(3000);
+        }   // end: 相机在位时的常规恢复分支
     }
 
     // ---- 复验（只有真的做过动作才复验）----
@@ -872,11 +1054,13 @@ int wmain(int argc, wchar_t** argv) {
         Line(L"  >>> 结果: 设备在位, 但档位仍不齐全 —— 建议完全关机再开机");
     } else {
         SetColor(C_ERR);
-        Line(L"  >>> 结果: 相机仍未就绪 —— 若反复如此, 考虑禁用 S0 待机(见 README)");
+        Line(L"  >>> 结果: 相机仍未就绪（清节点/重扫/根集线器/xHCI 全部无效）");
+        Line(L"      最后一步（物理操作，不改任何设置）：");
+        Line(L"      完全关机 → 拔掉电源适配器 → 长按电源键 30-60 秒 → 插电开机");
     }
     SetColor(C_DEF);
     Line(L"");
-    Line(L"  提示: 若画面再变模糊, 直接双击本程序即可恢复(默认动作就是恢复)。");
+    Line(L"  提示: 相机掉了就双击本程序, 它会自动跑到恢复为止。");
     Line(L"");
     Pause();
     return 0;
