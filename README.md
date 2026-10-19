@@ -134,6 +134,20 @@ mingw32-make
 
 ---
 
+## 更多文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/analysis-2026-10.md](docs/analysis-2026-10.md) | **完整技术分析**：症状 → 排查矩阵 → 根因（USB 枚举四阶段）→ 为什么 DRIPS 只是症状 → 三条独立证据 → 验证方法 → 可复用排查手法 |
+| [docs/retrospective.md](docs/retrospective.md) | 复盘随笔：怎么从「找不到相机」一步步追到根因 |
+| [docs/evidence-windows-drips.png](docs/evidence-windows-drips.png) | 系统事件日志截图（ID 196 直接点名相机 VID/PID） |
+| [docs/legacy-scripts/](docs/legacy-scripts/) | 早期 PowerShell 脚本链（已归档，仅作参考） |
+
+> 注意：技术分析文档记录了一次**结论修正** —— 第一阶段判断为驱动/电源管理问题，
+> 第二阶段被新证据推翻，最终指向排线接触不良。两段都保留了，因为"怎么发现判断错了"比结论本身更有用。
+
+---
+
 ## 版本记录
 
 | 版本 | 变更 |
