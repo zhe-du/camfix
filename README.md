@@ -3,6 +3,13 @@
 一个针对 **ThinkBook 16 G7 AHP (21MU)** 内置摄像头间歇性失效问题的根因分析与诊断工具。
 **C++17 + Win32 API,单文件 exe,零依赖。**
 
+## 下载
+
+不用自己编译：到 **[Releases](https://github.com/zhe-du/camfix/releases/latest)** 下载 `CamFix.exe`（单文件，免安装，双击即用）。
+
+> exe 未签名，首次运行可能被 SmartScreen 拦下 —— 点「更多信息 → 仍要运行」。
+> 想自己编译见下方「构建」。
+
 > **结论先行**:这是 Windows 现代待机(Modern Standby)的电源管理行为,与 Realtek DMFT
 > 复合相机「选择性暂停」能力不匹配所致 —— **不是摄像头硬件损坏**。
 
